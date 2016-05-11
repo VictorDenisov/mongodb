@@ -9,7 +9,7 @@ module Database.MongoDB.Connection (
     Pipe, close, isClosed,
     -- * Server
     Host(..), PortID(..), defaultPort, host, showHostPort, readHostPort,
-    readHostPortM, globalConnectTimeout, connect, connect',
+    readHostPortM, globalConnectTimeout, connect, connect', connectUnsafe,
     -- * Replica Set
     ReplicaSetName, openReplicaSet, openReplicaSet',
     ReplicaSet, primary, secondaryOk, routedHost, closeReplicaSet, replSetName
@@ -42,7 +42,7 @@ import Data.Text (Text)
 import qualified Data.Bson as B
 import qualified Data.Text as T
 
-import Database.MongoDB.Internal.Protocol (Pipe, newPipe, close, isClosed)
+import Database.MongoDB.Internal.Protocol (Pipe, newPipe, close, isClosed, newUnsafePipe)
 import Database.MongoDB.Internal.Util (untilSuccess, liftIOE,
                                        updateAssocs, shuffle, mergesortM)
 import Database.MongoDB.Query (Command, Failure(ConnectionFailure), access,
@@ -108,12 +108,22 @@ connect :: Host -> IO Pipe
 -- ^ Connect to Host returning pipelined TCP connection. Throw IOError if connection refused or no response within 'globalConnectTimeout'.
 connect h = readIORef globalConnectTimeout >>= flip connect' h
 
+connectUnsafe :: Host -> IO Pipe
+-- ^ Connect to Host returning pipelined TCP connection. Throw IOError if connection refused or no response within 'globalConnectTimeout'.
+connectUnsafe h = readIORef globalConnectTimeout >>= flip connectUnsafe' h
+
 connect' :: Secs -> Host -> IO Pipe
 -- ^ Connect to Host returning pipelined TCP connection. Throw IOError if connection refused or no response within given number of seconds.
 connect' timeoutSecs (Host hostname port) = do
     mh <- timeout (round $ timeoutSecs * 1000000) (connectTo hostname port)
     handle <- maybe (ioError $ userError "connect timed out") return mh
     newPipe handle
+
+connectUnsafe' :: Secs -> Host -> IO Pipe
+connectUnsafe' timeoutSecs (Host hostname port) = do
+    mh <- timeout (round $ timeoutSecs * 1000000) (connectTo hostname port)
+    handle <- maybe (ioError $ userError "connect timed out") return mh
+    newUnsafePipe handle
 
 -- * Replica Set
 

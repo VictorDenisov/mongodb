@@ -19,7 +19,7 @@
 module Database.MongoDB.Internal.Protocol (
     FullCollection,
     -- * Pipe
-    Pipe, newPipe, newPipeWith, send, call,
+    Pipe, newPipe, newPipeWith, send, call, newUnsafePipe,
     -- ** Notice
     Notice(..), InsertOption(..), UpdateOption(..), DeleteOption(..), CursorId,
     -- ** Request
@@ -39,7 +39,7 @@ import Data.Binary.Get (Get, runGet)
 import Data.Binary.Put (Put, runPut)
 import Data.Bits (bit, testBit)
 import Data.Int (Int32, Int64)
-import Data.IORef (IORef, newIORef, atomicModifyIORef)
+import Data.IORef (IORef, newIORef, atomicModifyIORef, writeIORef, readIORef)
 import System.IO (Handle)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Maybe (maybeToList)
@@ -80,47 +80,50 @@ mkWeakMVar :: MVar a -> IO () -> IO ()
 mkWeakMVar = addMVarFinalizer
 #endif
 
--- * Pipeline
-
 -- | Thread-safe and pipelined connection
-data Pipeline = Pipeline {
+data Pipe = Pipe {
     vStream :: MVar Transport,  -- ^ Mutex on handle, so only one thread at a time can write to it
     responseQueue :: Chan (MVar (Either IOError Response)),  -- ^ Queue of threads waiting for responses. Every time a response arrive we pop the next thread and give it the response.
     listenThread :: ThreadId
+
     }
+    | UnsafePipe Transport (IORef Bool)
 
 -- | Create new Pipeline over given handle. You should 'close' pipeline when finished, which will also close handle. If pipeline is not closed but eventually garbage collected, it will be closed along with handle.
-newPipeline :: Transport -> IO Pipeline
-newPipeline stream = do
+newPipeWith :: Transport -> IO Pipe
+newPipeWith stream = do
     vStream <- newMVar stream
     responseQueue <- newChan
     rec
-        let pipe = Pipeline{..}
+        let pipe = Pipe{..}
         listenThread <- forkIO (listen pipe)
     _ <- mkWeakMVar vStream $ do
         killThread listenThread
         T.close stream
     return pipe
 
-close :: Pipeline -> IO ()
+close :: Pipe -> IO ()
 -- ^ Close pipe and underlying connection
-close Pipeline{..} = do
+close Pipe{..} = do
     killThread listenThread
     T.close =<< readMVar vStream
+close (UnsafePipe transport unsafeClosed) = do
+    T.close transport
+    writeIORef unsafeClosed True
 
-isClosed :: Pipeline -> IO Bool
-isClosed Pipeline{listenThread} = do
+isClosed :: Pipe -> IO Bool
+isClosed Pipe{listenThread} = do
     status <- threadStatus listenThread
     return $ case status of
         ThreadRunning -> False
         ThreadFinished -> True
         ThreadBlocked _ -> False
         ThreadDied -> True
---isPipeClosed Pipeline{..} = isClosed =<< readMVar vHandle  -- isClosed hangs while listen loop is waiting on read
+isClosed (UnsafePipe _ unsafeClosed) = readIORef unsafeClosed
 
-listen :: Pipeline -> IO ()
+listen :: Pipe -> IO ()
 -- ^ Listen for responses and supply them to waiting threads in order
-listen Pipeline{..} = do
+listen Pipe{..} = do
     stream <- readMVar vStream
     forever $ do
         e <- try $ readMessage stream
@@ -129,34 +132,37 @@ listen Pipeline{..} = do
         case e of
             Left err -> T.close stream >> ioError err  -- close and stop looping
             Right _ -> return ()
+listen (UnsafePipe _ _) = undefined -- UnsafePipe is not meant for listen loop
 
-psend :: Pipeline -> Message -> IO ()
+psend :: Pipe -> Message -> IO ()
 -- ^ Send message to destination; the destination must not response (otherwise future 'call's will get these responses instead of their own).
 -- Throw IOError and close pipeline if send fails
-psend p@Pipeline{..} message = withMVar vStream (flip writeMessage message) `onException` close p
+psend p@Pipe{..} message = withMVar vStream (flip writeMessage message) `onException` close p
+psend p@(UnsafePipe transport _) message = (writeMessage transport message) `onException` close p
 
-pcall :: Pipeline -> Message -> IO (IO Response)
+pcall :: Pipe -> Message -> IO (IO Response)
 -- ^ Send message to destination and return /promise/ of response from one message only. The destination must reply to the message (otherwise promises will have the wrong responses in them).
 -- Throw IOError and closes pipeline if send fails, likewise for promised response.
-pcall p@Pipeline{..} message = withMVar vStream doCall `onException` close p  where
+pcall p@Pipe{..} message = withMVar vStream doCall `onException` close p  where
     doCall stream = do
         writeMessage stream message
         var <- newEmptyMVar
         liftIO $ writeChan responseQueue var
         return $ readMVar var >>= either throwIO return -- return promise
-
--- * Pipe
-
-type Pipe = Pipeline
--- ^ Thread-safe TCP connection with pipelined requests
+pcall (UnsafePipe transport _) message = (do
+    writeMessage transport message
+    return $ readMessage transport)
+      `onException` (T.close transport)
 
 newPipe :: Handle -> IO Pipe
 -- ^ Create pipe over handle
 newPipe handle = T.fromHandle handle >>= newPipeWith
 
-newPipeWith :: Transport -> IO Pipe
--- ^ Create pipe over connection
-newPipeWith conn = newPipeline conn
+newUnsafePipe :: Handle -> IO Pipe
+newUnsafePipe handle = do
+  transport <- T.fromHandle handle
+  unsafeClosed <- newIORef False
+  return $ UnsafePipe transport unsafeClosed
 
 send :: Pipe -> [Notice] -> IO ()
 -- ^ Send notices as a contiguous batch to server with no reply. Throw IOError if connection fails.
